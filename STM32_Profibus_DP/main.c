@@ -29,6 +29,10 @@
 /* ========================================================================= */
 /*  CMSIS Core & Device Headers (register definitions)                       */
 /* ========================================================================= */
+#include "i2c.h"
+#include "ssd1306.h"
+#include <stdio.h> // For snprintf
+
 /*
  * If you have CMSIS installed, replace the block below with:
  *   #include "stm32f411xe.h"
@@ -484,6 +488,16 @@ static uint8_t Input_Data_size;
 static uint8_t Output_Data_size;
 static uint8_t Vendor_Data_size;
 
+typedef enum {
+    DP_STATE_OFFLINE,
+    DP_STATE_WAIT_PRM,
+    DP_STATE_WAIT_CFG,
+    DP_STATE_DATA_EXCHANGE
+} DP_State_t;
+
+static volatile DP_State_t dp_state = DP_STATE_OFFLINE;
+static volatile uint32_t last_valid_msg_time = 0;
+
 /* Millisecond tick counter */
 static volatile uint32_t systick_ms = 0;
 
@@ -844,6 +858,8 @@ static void init_Profibus(void)
     group = 0;
     new_data = 0;
 
+    dp_state = DP_STATE_WAIT_PRM;
+
     slave_addr = SLAVE_ADDRESS;
     if ((slave_addr == 0) || (slave_addr > 126))
         slave_addr = DEFAULT_ADD;
@@ -977,6 +993,7 @@ static void profibus_RX(void)
     if (process_data)
     {
         master_addr = source_add;
+        last_valid_msg_time = millis(); // Valid message received
 
         /* Service Access Point detected? */
         if ((destination_add & 0x80) && (source_add & 0x80))
@@ -1081,6 +1098,7 @@ static void profibus_RX(void)
                         for (group = 0; uart_buffer[15] != 0; group++)
                             uart_buffer[15] >>= 1;
                         profibus_send_CMD(SC, 0, SAP_OFFSET, &uart_buffer[0], 0);
+                        dp_state = DP_STATE_WAIT_CFG;
                     }
                     break;
 
@@ -1160,6 +1178,7 @@ static void profibus_RX(void)
                     }
 
                     profibus_send_CMD(SC, 0, SAP_OFFSET, &uart_buffer[0], 0);
+                    dp_state = DP_STATE_DATA_EXCHANGE;
                     break;
 
                 default:
@@ -1536,14 +1555,65 @@ int main(void)
     init_Profibus();
     TX_ENABLE_OFF();  /* Ensure we start in receive mode */
 
-    /* Enable interrupts */
+    /* Enable interrupts — SysTick must be running before delay_ms() works */
     __asm volatile ("cpsie i");
 
+    /* I2C / OLED init AFTER interrupts enabled so SysTick ticks and
+     * delay_ms() works correctly. Delay 100 ms for OLED VDD to stabilise
+     * before sending the init command sequence. */
+    I2C1_Init();
+    delay_ms(100);
+    SSD1306_Init();
+
     /* ---- Main loop ---- */
-    uint32_t last_input_check = 0;
+    uint32_t last_input_check    = 0;
+    uint32_t last_display_update = 0;
+    char oled_buf[32];
 
     while (1)
     {
+        uint32_t current_time = millis();
+
+        // Check for Profibus timeout (e.g. 1500 ms without valid telegram)
+        if (dp_state != DP_STATE_OFFLINE && (current_time - last_valid_msg_time > 1500)) {
+            dp_state = DP_STATE_OFFLINE;
+        }
+
+        // Display update (every 100ms prevents OLED flickering or hogging CPU)
+        if (current_time - last_display_update > 100) {
+            last_display_update = current_time;
+
+            SSD1306_Fill(0);
+            
+            SSD1306_GotoXY(0, 0);
+            SSD1306_Puts(" Profibus Node", 1);
+            
+            SSD1306_GotoXY(0, 15);
+            snprintf(oled_buf, sizeof(oled_buf), " Addr: %d", slave_addr);
+            SSD1306_Puts(oled_buf, 1);
+
+            SSD1306_GotoXY(0, 30);
+            SSD1306_Puts(" State:", 1);
+
+            SSD1306_GotoXY(10, 45);
+            switch(dp_state) {
+                case DP_STATE_OFFLINE:
+                    SSD1306_Puts("OFFLINE / WAIT", 1);
+                    break;
+                case DP_STATE_WAIT_PRM:
+                    SSD1306_Puts("WAIT PRM", 1);
+                    break;
+                case DP_STATE_WAIT_CFG:
+                    SSD1306_Puts("WAIT CFG", 1);
+                    break;
+                case DP_STATE_DATA_EXCHANGE:
+                    SSD1306_Puts("DATA EXCHANGE", 1);
+                    break;
+            }
+
+            SSD1306_UpdateScreen();
+        }
+
         /* Poll touch button input (every ~1 ms) */
         if ((millis() - last_input_check) >= 1)
         {

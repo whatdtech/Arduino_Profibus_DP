@@ -27,7 +27,7 @@ FPU    = -mfloat-abi=soft
 MCU    = $(CPU) -mthumb $(FPU)
 
 # Sources
-C_SOURCES = main.c
+C_SOURCES = main.c i2c.c ssd1306.c
 ASM_SOURCES = stm32f411_startup.s
 
 # Linker script
